@@ -1,2 +1,2 @@
 # posplain
-Repository for position-aware explanation
+Repository for positional pair-wise explanation
