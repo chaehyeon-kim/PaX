@@ -18,7 +18,7 @@ def load_images(
     target_size=(224, 224),
     return_labels=False,
     label_column='label',
-    dataset_base_path='/shared_data0/cgoldberg/Concept_Inversion/Data'
+    dataset_base_path='../Data'
 ):
     """
     Generalized function to load images from various sources.
@@ -147,12 +147,12 @@ def load_image(image_path, apply_patches=False, patch_size=16, target_size=(224,
     return load_images(image_path, apply_patches, patch_size, target_size)
 
 
-def load_images_tensor(dataset_name='Broden-Pascal', apply_patches=False, patch_size=16, base_path='/shared_data0/cgoldberg/Concept_Inversion/Data'):
+def load_images_tensor(dataset_name='Broden-Pascal', apply_patches=False, patch_size=16, base_path = '../Data'):
     """Load images from dataset (backward compatibility)."""
     return load_images(dataset_name, apply_patches, patch_size, dataset_base_path=base_path)
 
 
-def load_images_tensor_with_labels(dataset_name='Broden-Pascal', label_column='label', apply_patches=False, patch_size=16, base_path='/shared_data0/cgoldberg/Concept_Inversion/Data'):
+def load_images_tensor_with_labels(dataset_name='Broden-Pascal', label_column='label', apply_patches=False, patch_size=16, base_path = '../Data'):
     """Load images with labels from dataset (backward compatibility)."""
     return load_images(
         dataset_name, 
