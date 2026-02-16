@@ -5,7 +5,6 @@ from typing import Callable, Optional
 import torch
 
 from .explainer_utils import (
-    RidgeRegression,
     build_interpretable_z,
     build_z_c,
     format_output,
@@ -13,10 +12,11 @@ from .explainer_utils import (
     perturb_X,
     perturb_Xp,
     prepare_raw_input,
-    weight,
 )
 
+
 Tensor = torch.Tensor
+
 
 def _select_target_logit(logits: Tensor, target: Optional[int | Tensor]) -> Tensor:
     if target is None:
@@ -28,7 +28,7 @@ def _select_target_logit(logits: Tensor, target: Optional[int | Tensor]) -> Tens
     return logits.gather(1, target_idx.view(-1, 1)).squeeze(1)
 
 
-def lime(
+def rise(
     X: Tensor,
     model: Callable[[Tensor], Tensor],
     process_fn: Optional[Callable[[Tensor], Tensor]] = None,
@@ -40,8 +40,7 @@ def lime(
 ) -> Tensor:
     if position_pair and not position:
         raise ValueError("position_pair=True requires position=True")
-    n_masks = int(kwargs.get("n_masks", 100))
-    l2 = float(kwargs.get("l2", 1.0))
+    n_masks = int(kwargs.get("n_masks", 512))
     seed = kwargs.get("seed", None)
     if seed is not None:
         torch.manual_seed(int(seed))
@@ -54,65 +53,40 @@ def lime(
         base_logits = model(prepare_raw_input(X_b, meta, process_fn))
         target_idx = base_logits.argmax(dim=-1) if target is None else target
 
-    X_lime_list, y_lime_list, weights_list = [], [], []
-    for _ in range(n_masks):
-        X0, zf = perturb_X(X_b, mask_rate=mask_rate, meta=meta, gate_mode="binary")
+    B = X_b.shape[0]
+    L = X_b.shape[2] if meta.shape_kind == "bcld" else X_b.shape[1]
+    if position:
+        F = 2 * L + (L * (L - 1) if position_pair else 0)
+    else:
+        F = L
+    importance = torch.zeros(B, F, device=X_b.device)
+
+    for b in range(B):
+        X_rep = X_b[b : b + 1].expand(n_masks, *X_b.shape[1:])
+        X0, zf = perturb_X(X_rep, mask_rate=mask_rate, meta=meta, gate_mode="binary")
         if position:
             Xp0, zp, perm_idx = perturb_Xp(X0, mask_rate=mask_rate, meta=meta, gate_mode="binary")
             z_c = build_z_c(perm_idx) if position_pair else None
             z = build_interpretable_z(zf, zp, z_c, position=True, position_pair=position_pair)
-            X_weights = weight(X0, X_b, meta=meta)
-            Xp_weights = weight(Xp0, X0, meta=meta)
-            if position_pair:
-                counterfactual_weights = torch.ones_like(z_c)
-                weights_sample = torch.cat([X_weights, Xp_weights, counterfactual_weights], dim=1)
-            else:
-                weights_sample = torch.cat([X_weights, Xp_weights], dim=1)
             x_eval = Xp0
         else:
             z = zf
-            weights_sample = weight(X0, X_b, meta=meta)
             x_eval = X0
 
         with torch.no_grad():
-            outputs0 = model(prepare_raw_input(x_eval, meta, process_fn))
-            logit0 = _select_target_logit(outputs0, target_idx)
+            logits = model(prepare_raw_input(x_eval, meta, process_fn))
+            scores = _select_target_logit(logits, int(target_idx[b].item()))
 
-        X_lime_list.append(z.unsqueeze(1))
-        y_lime_list.append(logit0.unsqueeze(1))
-        weights_list.append(weights_sample.unsqueeze(1))
+        numer = (scores.view(-1, 1) * z).sum(dim=0)
+        p = z.mean().clamp_min(1e-6)
+        importance[b] = numer / (n_masks * p)
 
-    X_lime = torch.cat(X_lime_list, dim=1)
-    y_lime = torch.cat(y_lime_list, dim=1)
-    weights = torch.cat(weights_list, dim=1)
-
-    importances = []
-    for b in range(X_b.shape[0]):
-        r_model = RidgeRegression(X_lime.shape[2], alpha=l2).to(X_b.device)
-        optimizer = torch.optim.Adam(r_model.parameters(), lr=0.01)
-        for _ in range(100):
-            r_model.train()
-            optimizer.zero_grad()
-            loss = r_model.compute_loss(X_lime[b], y_lime[b], weights[b])
-            loss.backward(retain_graph=True)
-            optimizer.step()
-        w = r_model.linear.weight.detach().view(-1)
-        importances.append(w)
-
-    importance = torch.stack(importances, dim=0)
     if position and position_pair:
-        L = X_b.shape[2] if meta.shape_kind == "bcld" else X_b.shape[1]
         feature_attr = importance[:, :L]
         position_attr = importance[:, L : 2 * L]
         counterfactual_flat = importance[:, 2 * L :]
         eye = torch.eye(L, device=importance.device, dtype=torch.bool)
-        counterfactual_attr = torch.zeros(
-            importance.shape[0],
-            L,
-            L,
-            device=importance.device,
-            dtype=importance.dtype,
-        )
+        counterfactual_attr = torch.zeros(B, L, L, device=importance.device, dtype=importance.dtype)
         counterfactual_attr[:, ~eye] = counterfactual_flat
         return format_output((feature_attr, position_attr, counterfactual_attr), meta)
     return format_output(importance, meta)
@@ -128,7 +102,7 @@ def explain(
     mask_rate: float = 0.5,
     **kwargs,
 ) -> Tensor:
-    return lime(
+    return rise(
         X,
         model,
         process_fn=process_fn,

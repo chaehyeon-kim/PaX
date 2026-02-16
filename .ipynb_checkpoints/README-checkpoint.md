@@ -1,7 +1,2 @@
-<<<<<<< HEAD
-# PaX
-Repository for Position-aware eXplanation
-=======
 # pax
 Repository for 'Position-aware eXplanation: A Model Agnostic Framework for Positional Attributions'
->>>>>>> 981fc7f (update)
