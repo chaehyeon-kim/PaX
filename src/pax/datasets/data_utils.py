@@ -18,11 +18,7 @@ def load_images(
     target_size=(224, 224),
     return_labels=False,
     label_column='label',
-<<<<<<< HEAD
     dataset_base_path='../Data'
-=======
-    dataset_base_path='/'
->>>>>>> 981fc7f (update)
 ):
     """
     Generalized function to load images from various sources.

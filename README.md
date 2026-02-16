@@ -19,7 +19,8 @@ PaX/
             ├── poslime.py           # Position-aware LIME
             ├── posrise.py           # Position-aware RISE
             ├── posshap.py           # Position-aware SHAP
-            └── posshapiq.py         # Position-aware SHAP-IQ
+            ├── posshapiq.py         # Position-aware SHAP-IQ
+            └── posmfaba.py          # Position-aware MFABA
 ```
 
 ### Key Directories

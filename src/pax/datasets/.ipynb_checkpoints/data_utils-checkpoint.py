@@ -18,7 +18,7 @@ def load_images(
     target_size=(224, 224),
     return_labels=False,
     label_column='label',
-    dataset_base_path='/'
+    dataset_base_path='../Data'
 ):
     """
     Generalized function to load images from various sources.
@@ -147,12 +147,20 @@ def load_image(image_path, apply_patches=False, patch_size=16, target_size=(224,
     return load_images(image_path, apply_patches, patch_size, target_size)
 
 
+<<<<<<< HEAD
+def load_images_tensor(dataset_name='Broden-Pascal', apply_patches=False, patch_size=16, base_path = '../Data'):
+=======
 def load_images_tensor(dataset_name='Broden-Pascal', apply_patches=False, patch_size=16, base_path='/Data'):
+>>>>>>> 981fc7f (update)
     """Load images from dataset (backward compatibility)."""
     return load_images(dataset_name, apply_patches, patch_size, dataset_base_path=base_path)
 
 
+<<<<<<< HEAD
+def load_images_tensor_with_labels(dataset_name='Broden-Pascal', label_column='label', apply_patches=False, patch_size=16, base_path = '../Data'):
+=======
 def load_images_tensor_with_labels(dataset_name='Broden-Pascal', label_column='label', apply_patches=False, patch_size=16, base_path='/Data'):
+>>>>>>> 981fc7f (update)
     """Load images with labels from dataset (backward compatibility)."""
     return load_images(
         dataset_name, 
