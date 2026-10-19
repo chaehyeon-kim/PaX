@@ -277,3 +277,105 @@ def perturb_Xp(
                 perm_idx[b] = _permute_full(L, X0.device)
     Xp0 = apply_position_indicator(X0, zp, meta, gate_mode=gate_mode, perm_idx=perm_idx)
     return Xp0, zp, perm_idx
+
+# ---------------------------------------------------------------------------
+# PosSwap sampler and assignment record (PaX formalism, Definitions 2 and 4).
+#
+# Index conventions used by everything below:
+#   src[n, j]  = content placed at slot j       (sigma^{-1}(j))
+#   dest[n, i] = slot that content i moves to   (sigma(i))
+#   R[n, i, j] = 1[sigma(i) = j]                (content i occupies slot j)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PosSwapDraw:
+    src: Tensor
+    dest: Tensor
+    coins: Tensor
+
+
+def pos_swap(zp: Tensor) -> PosSwapDraw:
+    """PosSwap (Definition 2, Algorithm 1).
+
+    zp is an [N, L] retention vector in [0, 1] (1 retains position i, 0 fully perturbs it).
+    Draws coins b_i ~ Bern(1 - zp_i) independently, forms the pool S = {i : b_i = 1},
+    and draws sigma uniformly from Sym(S), extended by the identity on the complement.
+    Fixed points inside the pool are kept, and |S| <= 1 yields the identity.
+    At binary zp the coins are degenerate and the pool equals the mask's perturbed set.
+    """
+    if zp.dim() == 1:
+        zp = zp.unsqueeze(0)
+    N, L = zp.shape
+    device = zp.device
+    coins = torch.rand(N, L, device=device) < (1.0 - zp)
+    ar = torch.arange(L, device=device).expand(N, L)
+    # Pool slots in ascending order, followed by the fixed slots.
+    slot_order = torch.argsort(torch.where(coins, ar, ar + L), dim=1)
+    # Pool contents in uniformly random order, followed by the fixed contents.
+    content_keys = torch.where(coins, torch.rand(N, L, device=device), (ar + L).to(torch.float32))
+    content_order = torch.argsort(content_keys, dim=1)
+    src = torch.empty(N, L, dtype=torch.long, device=device).scatter_(1, slot_order, content_order)
+    dest = torch.empty(N, L, dtype=torch.long, device=device).scatter_(1, content_order, slot_order)
+    return PosSwapDraw(src=src, dest=dest, coins=coins)
+
+
+def permute_content(X0: Tensor, src: Tensor, meta: InputMeta) -> Tensor:
+    """Evaluate f'(., Pi_sigma P) by reordering the input (Definition 1, eq. 2).
+
+    Slot j receives content src[:, j], so content i lands at slot sigma(i).
+    """
+    return _gather_permuted(X0, src, meta)
+
+
+def offdiag_record(dest: Tensor) -> Tensor:
+    """Off-diagonal entries of the assignment record R (Definition 4).
+
+    Returns [N, L*(L-1)], row-major over (i, j != i), with entry 1 iff sigma(i) = j.
+    """
+    L = dest.shape[1]
+    R = torch.nn.functional.one_hot(dest, num_classes=L).to(torch.float32)
+    offdiag = ~torch.eye(L, dtype=torch.bool, device=dest.device)
+    return R[:, offdiag]
+
+
+def unflatten_offdiag(flat: Tensor, L: int) -> Tensor:
+    """Inverse of the off-diagonal flattening: [B, L*(L-1)] -> [B, L, L] with a zero diagonal."""
+    out = torch.zeros(flat.shape[0], L, L, device=flat.device, dtype=flat.dtype)
+    out[:, ~torch.eye(L, dtype=torch.bool, device=flat.device)] = flat
+    return out
+
+
+def lime_kernel(mask: Tensor, kernel_width: float = 0.25) -> Tensor:
+    """LIME proximity kernel pi(z) on a binary mask, one weight per sample.
+
+    Matches the reference LIME image/text explainers: cosine distance d between z and the
+    all-ones (unperturbed) mask, weight sqrt(exp(-d^2 / kernel_width^2)).
+    """
+    cos = torch.nn.functional.cosine_similarity(mask, torch.ones_like(mask), dim=1, eps=1e-12)
+    d = 1.0 - cos
+    return torch.sqrt(torch.exp(-(d ** 2) / kernel_width ** 2))
+
+
+def weighted_ridge(Z: Tensor, y: Tensor, w: Tensor, l2: float) -> Tensor:
+    """argmin_beta sum_m w_m (y_m - beta_0 - beta^T z_m)^2 + l2 * ||beta||^2.
+
+    The intercept is unpenalized and not returned. Solved in closed form, using the dual
+    (M x M) system when features outnumber samples, e.g. with the L*(L-1) pair coordinates.
+    """
+    out_dtype = Z.dtype
+    Z, y, w = Z.double(), y.double().view(-1), w.double().view(-1)
+    wsum = w.sum()
+    Zc = Z - (w[:, None] * Z).sum(0) / wsum
+    yc = y - (w * y).sum() / wsum
+    sw = w.sqrt()
+    A = sw[:, None] * Zc
+    c = sw * yc
+    M, F = A.shape
+    if l2 <= 0:
+        beta = torch.linalg.pinv(A) @ c
+    elif F <= M:
+        beta = torch.linalg.solve(A.T @ A + l2 * torch.eye(F, dtype=A.dtype, device=A.device), A.T @ c)
+    else:
+        beta = A.T @ torch.linalg.solve(A @ A.T + l2 * torch.eye(M, dtype=A.dtype, device=A.device), c)
+    return beta.to(out_dtype)
