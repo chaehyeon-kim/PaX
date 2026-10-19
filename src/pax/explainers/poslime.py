@@ -5,18 +5,21 @@ from typing import Callable, Optional
 import torch
 
 from .explainer_utils import (
-    RidgeRegression,
-    build_interpretable_z,
-    build_z_c,
+    _get_L,
     format_output,
+    lime_kernel,
     normalize_input,
+    offdiag_record,
+    permute_content,
     perturb_X,
-    perturb_Xp,
+    pos_swap,
     prepare_raw_input,
-    weight,
+    unflatten_offdiag,
+    weighted_ridge,
 )
 
 Tensor = torch.Tensor
+
 
 def _select_target_logit(logits: Tensor, target: Optional[int | Tensor]) -> Tensor:
     if target is None:
@@ -26,6 +29,15 @@ def _select_target_logit(logits: Tensor, target: Optional[int | Tensor]) -> Tens
     else:
         target_idx = target.to(logits.device)
     return logits.gather(1, target_idx.view(-1, 1)).squeeze(1)
+
+
+def _batched_target_logits(model, X_eval, meta, process_fn, target: int, batch_size: int) -> Tensor:
+    outs = []
+    with torch.no_grad():
+        for s in range(0, X_eval.shape[0], batch_size):
+            logits = model(prepare_raw_input(X_eval[s : s + batch_size], meta, process_fn))
+            outs.append(_select_target_logit(logits, target))
+    return torch.cat(outs)
 
 
 def lime(
@@ -38,10 +50,33 @@ def lime(
     mask_rate: float = 0.5,
     **kwargs,
 ) -> Tensor:
+    """PaX-LIME (Section 6.2, Algorithms 2-4).
+
+    LIME runs verbatim on the reference-vector coordinates z' = (zx, zp), extended by the
+    off-diagonal assignment record R when position_pair=True:
+      1. sample a binary mask z' with P(z'_k = 1) = mask_rate (0.5 is Unif{0,1}^{2n}, Algorithm 3),
+      2. evaluate one draw of g': content masking on zx, PosSwap on zp. This is a single-sample
+         unbiased estimate of v(z'), and the drawn sigma is the only new randomness,
+      3. weight the sample by the LIME proximity kernel pi(z') on the sampled mask. R is induced
+         by the sampler rather than sampled by the explainer, so it does not enter pi,
+      4. fit the weighted ridge surrogate on (zx, zp[, offdiag R]).
+
+    kwargs: n_masks (default 100), l2 (default 1.0), kernel_width (default 0.25),
+    batch_size (default 64), seed.
+
+    Returns, per input:
+      position=False                       -> alpha_x [L]
+      position=True, position_pair=False   -> cat(alpha_x, alpha_p) [2L]
+      position_pair=True                   -> (alpha_x [L], alpha_p [L], alpha_q [L, L])
+    alpha_q[i, j] scores content i occupying slot j (zero diagonal). Compare coefficients
+    within a block only, since cross-block magnitudes depend on the regularization.
+    """
     if position_pair and not position:
         raise ValueError("position_pair=True requires position=True")
     n_masks = int(kwargs.get("n_masks", 100))
     l2 = float(kwargs.get("l2", 1.0))
+    kernel_width = float(kwargs.get("kernel_width", 0.25))
+    batch_size = int(kwargs.get("batch_size", 64))
     seed = kwargs.get("seed", None)
     if seed is not None:
         torch.manual_seed(int(seed))
@@ -52,68 +87,40 @@ def lime(
 
     with torch.no_grad():
         base_logits = model(prepare_raw_input(X_b, meta, process_fn))
-        target_idx = base_logits.argmax(dim=-1) if target is None else target
+    if target is None:
+        target_idx = base_logits.argmax(dim=-1)
+    elif isinstance(target, int):
+        target_idx = torch.full((X_b.shape[0],), target, dtype=torch.long)
+    else:
+        target_idx = target.view(-1)
 
-    X_lime_list, y_lime_list, weights_list = [], [], []
-    for _ in range(n_masks):
-        X0, zf = perturb_X(X_b, mask_rate=mask_rate, meta=meta, gate_mode="binary")
+    B = X_b.shape[0]
+    L = _get_L(X_b, meta)
+    device = X_b.device
+    F = L if not position else 2 * L + (L * (L - 1) if position_pair else 0)
+    importance = torch.zeros(B, F, device=device)
+
+    for b in range(B):
+        X_rep = X_b[b : b + 1]
+        zf = torch.bernoulli(torch.full((n_masks, L), mask_rate, device=device))
+        X0, _ = perturb_X(X_rep, meta=meta, zf=zf)  # content perturbation g(x, zx)
         if position:
-            Xp0, zp, perm_idx = perturb_Xp(X0, mask_rate=mask_rate, meta=meta, gate_mode="binary")
-            z_c = build_z_c(perm_idx) if position_pair else None
-            z = build_interpretable_z(zf, zp, z_c, position=True, position_pair=position_pair)
-            X_weights = weight(X0, X_b, meta=meta)
-            Xp_weights = weight(Xp0, X0, meta=meta)
-            if position_pair:
-                counterfactual_weights = torch.ones_like(z_c)
-                weights_sample = torch.cat([X_weights, Xp_weights, counterfactual_weights], dim=1)
-            else:
-                weights_sample = torch.cat([X_weights, Xp_weights], dim=1)
-            x_eval = Xp0
+            zp = torch.bernoulli(torch.full((n_masks, L), mask_rate, device=device))
+            draw = pos_swap(zp)  # pool = {i : zp_i = 0}, sigma ~ Unif(Sym(pool))
+            x_eval = permute_content(X0, draw.src, meta)
+            mask = torch.cat([zf, zp], dim=1)
+            z = torch.cat([mask, offdiag_record(draw.dest)], dim=1) if position_pair else mask
         else:
-            z = zf
-            weights_sample = weight(X0, X_b, meta=meta)
-            x_eval = X0
+            x_eval, mask, z = X0, zf, zf
 
-        with torch.no_grad():
-            outputs0 = model(prepare_raw_input(x_eval, meta, process_fn))
-            logit0 = _select_target_logit(outputs0, target_idx)
+        y = _batched_target_logits(model, x_eval, meta, process_fn, int(target_idx[b].item()), batch_size)
+        w = lime_kernel(mask, kernel_width)
+        importance[b] = weighted_ridge(z, y, w, l2)
 
-        X_lime_list.append(z.unsqueeze(1))
-        y_lime_list.append(logit0.unsqueeze(1))
-        weights_list.append(weights_sample.unsqueeze(1))
-
-    X_lime = torch.cat(X_lime_list, dim=1)
-    y_lime = torch.cat(y_lime_list, dim=1)
-    weights = torch.cat(weights_list, dim=1)
-
-    importances = []
-    for b in range(X_b.shape[0]):
-        r_model = RidgeRegression(X_lime.shape[2], alpha=l2).to(X_b.device)
-        optimizer = torch.optim.Adam(r_model.parameters(), lr=0.01)
-        for _ in range(100):
-            r_model.train()
-            optimizer.zero_grad()
-            loss = r_model.compute_loss(X_lime[b], y_lime[b], weights[b])
-            loss.backward(retain_graph=True)
-            optimizer.step()
-        w = r_model.linear.weight.detach().view(-1)
-        importances.append(w)
-
-    importance = torch.stack(importances, dim=0)
     if position and position_pair:
-        L = X_b.shape[2] if meta.shape_kind == "bcld" else X_b.shape[1]
         feature_attr = importance[:, :L]
         position_attr = importance[:, L : 2 * L]
-        counterfactual_flat = importance[:, 2 * L :]
-        eye = torch.eye(L, device=importance.device, dtype=torch.bool)
-        counterfactual_attr = torch.zeros(
-            importance.shape[0],
-            L,
-            L,
-            device=importance.device,
-            dtype=importance.dtype,
-        )
-        counterfactual_attr[:, ~eye] = counterfactual_flat
+        counterfactual_attr = unflatten_offdiag(importance[:, 2 * L :], L)
         return format_output((feature_attr, position_attr, counterfactual_attr), meta)
     return format_output(importance, meta)
 
